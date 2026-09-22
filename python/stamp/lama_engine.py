@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 from PIL import Image
+from scipy import ndimage
 from simple_lama_inpainting.utils import download_model, prepare_img_and_mask
 
 LAMA_MODEL_URL = (
@@ -43,5 +44,15 @@ class LamaEngine:
         # prepare_img_and_mask pads to a multiple of 8 (symmetric padding) but
         # never crops back -- the model output keeps that padded size.
         result = result[:orig_h, :orig_w]
+        # big-lama's decoder uses strided transposed convolutions, a
+        # well-known source of a faint periodic checkerboard artifact
+        # (Odena et al. 2016) -- normally masked by texture/clutter in the
+        # natural photos it was trained on, but clearly visible on the
+        # smooth/flat astro backgrounds this tool targets. A very light
+        # blur kills that fixed ~2px-period pattern without touching real
+        # structure; cli_stamp.py's match_noise() step re-adds the correct
+        # amount of real (random, non-periodic) grain on top afterward, so
+        # texture statistics still end up matching the surrounding sky.
+        result = ndimage.gaussian_filter(result, sigma=(0.7, 0.7, 0))
         result = np.clip(result * 255, 0, 255).astype(np.uint8)
         return Image.fromarray(result)
