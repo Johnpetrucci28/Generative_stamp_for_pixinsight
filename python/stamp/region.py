@@ -36,6 +36,33 @@ def _highpass_sigma(x: np.ndarray, ref_mask: np.ndarray, blur_sigma: float = 3.0
     return float(1.4826 * np.median(np.abs(ref - np.median(ref))))
 
 
+def correlated_noise_field(shape: tuple, sigma: float, rng: np.random.Generator, corr_size: int = 2) -> np.ndarray:
+    """Spatially-correlated noise field, ported from HaloNet's
+    halo_anomaly_mask.py (round 55, 2026-10-04 -- same grain-matching
+    problem, found and fixed there first).
+
+    A plain `rng.normal(0, sigma, ...)` is spatially INDEPENDENT white
+    noise, but real sky background isn't: measured directly on genuine
+    empty sky, adjacent-pixel correlation was 0.587 (likely from
+    drizzle/debayer resampling) versus -0.003 (noise floor) for i.i.d.
+    noise. Fed to an AI denoiser or just looked at closely, that mismatch
+    reads as the fill looking "too fine/sharp" -- grainy in a different,
+    finer way than the real surrounding texture.
+
+    Fix: blur finer unit-variance white noise with a `corr_size`x
+    `corr_size` uniform box, renormalize to unit std (so the correlation
+    structure is set once, independent of `sigma`), then scale by `sigma`.
+    An NxN uniform box blur of white noise leaves EXACT adjacent-pixel
+    correlation (N-1)/N -- N=2 gives 0.5, close to the 0.587 measured on
+    real data, without fitting an unmeasured number."""
+    fine = rng.normal(0.0, 1.0, size=shape)
+    blurred = ndimage.uniform_filter(fine, size=corr_size)
+    cur_std = float(np.std(blurred))
+    if cur_std <= 0:
+        return np.zeros(shape)
+    return (blurred / cur_std) * sigma
+
+
 def match_noise(crop: np.ndarray, result: np.ndarray, mask: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
     """Top up `result` with synthetic noise so its fine-grain texture inside
     the masked region matches the real texture measured outside it.
@@ -57,7 +84,7 @@ def match_noise(crop: np.ndarray, result: np.ndarray, mask: np.ndarray, valid_ma
         fill_sigma = _highpass_sigma(c_res, mask_bool)
         deficit = np.sqrt(max(0.0, real_sigma**2 - fill_sigma**2))
         if deficit > 0:
-            noise = np.random.default_rng().normal(0, deficit, size=c_res.shape)
+            noise = correlated_noise_field(c_res.shape, deficit, np.random.default_rng())
             c_res = c_res + noise
         out_channels.append(c_res)
 
