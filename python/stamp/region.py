@@ -26,14 +26,46 @@ def mask_bbox(mask: np.ndarray, pad: int, min_size: int = 256):
     )
 
 
+def _highpass_residual(x: np.ndarray, blur_sigma: float = 3.0) -> np.ndarray:
+    """Fine-grain (high-frequency) residual of x -- x minus its own smooth
+    (low-frequency) component."""
+    return x - ndimage.gaussian_filter(x, sigma=blur_sigma)
+
+
 def _highpass_sigma(x: np.ndarray, ref_mask: np.ndarray, blur_sigma: float = 3.0) -> float:
     """Robust std of the fine-grain (high-frequency) residual of x, measured
     only over ref_mask pixels. Used to compare how much real texture/noise
     is present in two regions regardless of their average brightness."""
-    smooth = ndimage.gaussian_filter(x, sigma=blur_sigma)
-    residual = x - smooth
+    residual = _highpass_residual(x, blur_sigma)
     ref = residual[ref_mask] if ref_mask.any() else residual.ravel()
     return float(1.4826 * np.median(np.abs(ref - np.median(ref))))
+
+
+def _measure_corr_sigma(residual: np.ndarray, valid_mask: np.ndarray, fallback: float = 0.7) -> float:
+    """Equivalent gaussian correlation length of the REAL noise in this
+    specific crop, measured directly (not borrowed from a different
+    image/camera/pipeline) -- the lag-1 adjacent-pixel correlation of
+    `residual` over valid (unmasked) pixel pairs, converted to the
+    corr_sigma that would reproduce it via correlated_noise_field()'s own
+    formula: correlation(1px) = exp(-1/(4*corr_sigma**2))
+    => corr_sigma = sqrt(-1 / (4*ln(correlation))).
+
+    Falls back to `fallback` (the value measured once on HaloNet's own
+    SH2-129 data) if there isn't enough valid context to measure reliably,
+    or the measured correlation is degenerate (<=0, since different
+    cameras/drizzle/debayer pipelines can plausibly land anywhere -- no
+    assumption is made about what a "normal" value looks like beyond
+    requiring it to be a real, positive correlation)."""
+    h_valid = valid_mask[:, :-1] & valid_mask[:, 1:]
+    v_valid = valid_mask[:-1, :] & valid_mask[1:, :]
+    a = np.concatenate([residual[:, :-1][h_valid], residual[:-1, :][v_valid]])
+    b = np.concatenate([residual[:, 1:][h_valid], residual[1:, :][v_valid]])
+    if len(a) < 200:
+        return fallback
+    rho = float(np.corrcoef(a, b)[0, 1])
+    if not np.isfinite(rho) or rho <= 0.02 or rho >= 0.98:
+        return fallback
+    return float(np.sqrt(-1.0 / (4.0 * np.log(rho))))
 
 
 def correlated_noise_field(shape: tuple, sigma: float, rng: np.random.Generator, corr_sigma: float = 0.7) -> np.ndarray:
@@ -91,11 +123,20 @@ def match_noise(crop: np.ndarray, result: np.ndarray, mask: np.ndarray, valid_ma
 
     out_channels = []
     for c_crop, c_res in zip(channels_crop, channels_res):
+        residual_crop = _highpass_residual(c_crop)
         real_sigma = _highpass_sigma(c_crop, valid_mask)
         fill_sigma = _highpass_sigma(c_res, mask_bool)
         deficit = np.sqrt(max(0.0, real_sigma**2 - fill_sigma**2))
         if deficit > 0:
-            noise = correlated_noise_field(c_res.shape, deficit, np.random.default_rng())
+            # Measured on THIS crop's own real pixels, not a constant
+            # borrowed from a different image/camera/pipeline -- every
+            # drizzle/debayer/stacking setup has its own correlation
+            # length, and a borrowed value only approximates it (see
+            # correlated_noise_field's docstring for why that approximation
+            # can still leave a faint, "trivial under stretch+denoise"
+            # residual mismatch).
+            corr_sigma = _measure_corr_sigma(residual_crop, valid_mask)
+            noise = correlated_noise_field(c_res.shape, deficit, np.random.default_rng(), corr_sigma=corr_sigma)
             c_res = c_res + noise
         out_channels.append(c_res)
 
