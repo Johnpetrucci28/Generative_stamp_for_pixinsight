@@ -36,27 +36,38 @@ def _highpass_sigma(x: np.ndarray, ref_mask: np.ndarray, blur_sigma: float = 3.0
     return float(1.4826 * np.median(np.abs(ref - np.median(ref))))
 
 
-def correlated_noise_field(shape: tuple, sigma: float, rng: np.random.Generator, corr_size: int = 2) -> np.ndarray:
+def correlated_noise_field(shape: tuple, sigma: float, rng: np.random.Generator, corr_sigma: float = 0.7) -> np.ndarray:
     """Spatially-correlated noise field, ported from HaloNet's
     halo_anomaly_mask.py (round 55, 2026-10-04 -- same grain-matching
-    problem, found and fixed there first).
+    problem, found and fixed there first), then refined here (IA stamp,
+    same day) after a real "effet passoire" (sieve-like, pareidolic
+    texture) complaint on the first version.
 
     A plain `rng.normal(0, sigma, ...)` is spatially INDEPENDENT white
     noise, but real sky background isn't: measured directly on genuine
     empty sky, adjacent-pixel correlation was 0.587 (likely from
     drizzle/debayer resampling) versus -0.003 (noise floor) for i.i.d.
-    noise. Fed to an AI denoiser or just looked at closely, that mismatch
-    reads as the fill looking "too fine/sharp" -- grainy in a different,
-    finer way than the real surrounding texture.
+    noise.
 
-    Fix: blur finer unit-variance white noise with a `corr_size`x
-    `corr_size` uniform box, renormalize to unit std (so the correlation
-    structure is set once, independent of `sigma`), then scale by `sigma`.
-    An NxN uniform box blur of white noise leaves EXACT adjacent-pixel
-    correlation (N-1)/N -- N=2 gives 0.5, close to the 0.587 measured on
-    real data, without fitting an unmeasured number."""
+    HaloNet's own fix used an NxN uniform BOX blur (N=2 -> exact 0.5
+    correlation at lag 1), which matched the target amplitude but has a
+    sharp cutoff: lag-1 correlation ~0.5, lag-2 correlation already back
+    down near 0. That abrupt cutoff gives the noise a quasi-periodic,
+    tiled 2x2-block structure -- invisible in a single correlation number,
+    but visually reads as a repeating "sieve"/cellular motif once your eye
+    latches onto it (pareidolia). A real optical/sampling PSF has no such
+    hard edge.
+
+    Fix here: a GAUSSIAN blur instead of a box -- same idea (blur
+    unit-variance white noise, renormalize to unit std, scale by sigma),
+    but its autocorrelation decays smoothly with no fixed length scale
+    (lag-1 ~0.58, lag-2 ~0.13, lag-3 ~0.01 at corr_sigma=0.7, vs the box's
+    0.50/~0/~0) -- no periodic motif for the eye to lock onto.
+    corr_sigma=0.7 was solved numerically to hit the same real lag-1
+    target (0.587) the box version was tuned to, via
+    correlation(1px) = exp(-1/(4*corr_sigma**2)) for a gaussian kernel."""
     fine = rng.normal(0.0, 1.0, size=shape)
-    blurred = ndimage.uniform_filter(fine, size=corr_size)
+    blurred = ndimage.gaussian_filter(fine, sigma=corr_sigma)
     cur_std = float(np.std(blurred))
     if cur_std <= 0:
         return np.zeros(shape)
